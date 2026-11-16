@@ -1,0 +1,155 @@
+# Shared defaults: service definitions, healthchecks, networks, volumes.
+# Never used alone — always merged with an overlay:
+#   dev:  docker compose -f docker-compose.base.yml -f docker-compose.dev.yml up -d
+#   prod: docker compose -f docker-compose.base.yml -f docker-compose.prod.yml up -d
+# Design: wallet-system-design.md §9
+
+name: wallet-platform
+
+networks:
+  wallet-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---------- PostgreSQL: one instance, one schema per service (ADR-003) ----------
+  postgres:
+    image: postgres:16-alpine # design §3 — Postgres has no formal "LTS"; every major is supported 5 years, 16 until 2028-11
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      # per-service roles + schemas, created by ../postgres/init on first boot;
+      # migrations themselves are owned by each service via Flyway (design §3)
+      USER_SERVICE_DB_PASSWORD: ${USER_SERVICE_DB_PASSWORD:?set in .env}
+      WALLET_SERVICE_DB_PASSWORD: ${WALLET_SERVICE_DB_PASSWORD:?set in .env}
+      LEDGER_SERVICE_DB_PASSWORD: ${LEDGER_SERVICE_DB_PASSWORD:?set in .env}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [wallet-net]
+
+  # ---------- Redis: read-path cache / idempotency / blacklist / rate limits ----------
+  redis:
+    image: redis:7.2-alpine # Redis has no formal LTS; 7.2 is the conservative, long-supported line (ADR-007: Redis is disposable)
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["redis-server", "--appendonly", "yes"] # AOF for dev convenience only — a flush must never corrupt anything (§5.4)
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [wallet-net]
+
+  # ---------- Kafka: domain events after commit via transactional outbox (ADR-004) ----------
+  kafka:
+    image: confluentinc/cp-kafka:7.9.0 # Kafka 3.9 — Confluent Platform LTS line; KRaft mode, no ZooKeeper
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # topics are code — see scripts/seed.sh
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks: [wallet-net]
+
+  # ---------- Keycloak: OAuth2/JWT issuer (ADR-002) ----------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3 # 26.x is the current stable line; Keycloak has no formal LTS
+    restart: unless-stopped
+    logging: *default-logging
+    # start-dev until prod hardening lands (--optimized, TLS, hostname) — see docker-compose.prod.yml
+    command: ["start-dev", "--import-realm"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:?set in .env}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:?set in .env}
+      KC_DB_SCHEMA: keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .env}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      # versioned realm export (design §6) — import is idempotent, skipped if realm exists
+      - ../keycloak/wallet-realm.json:/opt/keycloak/data/import/wallet-realm.json:ro
+    healthcheck:
+      # no curl/wget in the keycloak image — minimal HTTP probe over bash /dev/tcp
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c \"exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    networks: [wallet-net]
+
+  # ---------- Nginx: API gateway (ADR-001) ----------
+  nginx:
+    image: nginx:1.28-alpine # 1.28.x = stable branch (the LTS-like line); mainline moves faster
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../nginx/conf.d:/etc/nginx/conf.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q --spider http://127.0.0.1/nginx-health || exit 1",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [wallet-net]

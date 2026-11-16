@@ -1,0 +1,9 @@
+# secrets — only .env.example is committed (design §9)
+.env
+.env.*
+!.env.example
+
+# local junk
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,67 @@
+# Prod overlay: published images, resource limits, no debug ports.
+# Only the gateway is exposed. Services are added here as their images get
+# published by each repo's CI (design §9).
+#   docker compose -f docker-compose.base.yml -f docker-compose.prod.yml up -d
+
+services:
+  postgres:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+
+  redis:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  kafka:
+    restart: always
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx1g -Xms512m"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+  keycloak:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g # design §12: ~1 GB RAM accepted
+    # TODO prod hardening before real deploy: `start --optimized` with a build stage,
+    # TLS in front, KC_HOSTNAME set, start-dev removed.
+
+  nginx:
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443" # TLS termination + prod gateway conf land in infra/nginx/conf.d/ when certs exist
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256m
+
+  # ---------- application services (added when images exist) ----------
+  # user-service:
+  #   image: ghcr.io/<org>/wallet-user-service:${TAG:?set TAG}
+  #   restart: always
+  #   environment:
+  #     SPRING_DATASOURCE_USERNAME: user_service
+  #     SPRING_DATASOURCE_PASSWORD: ${USER_SERVICE_DB_PASSWORD:?set in .env}
+  #   depends_on:
+  #     postgres: { condition: service_healthy }
+  #     kafka:    { condition: service_healthy }
+  #   networks: [wallet-net]
+  #
+  # wallet-service / ledger-service follow the same shape, with their own roles
+  # (wallet_service, ledger_service) and /api/wallet, /api/ledger routes.

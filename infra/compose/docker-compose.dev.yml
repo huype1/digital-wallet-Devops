@@ -1,0 +1,27 @@
+# Dev overlay: host ports for direct debugging, everything bound to loopback only.
+#   docker compose -f docker-compose.base.yml -f docker-compose.dev.yml up -d
+# (or just ./scripts/up.sh)
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  kafka:
+    ports:
+      - "127.0.0.1:9092:9092" # PLAINTEXT_HOST listener — host tools and services run outside compose
+
+  keycloak:
+    ports:
+      - "127.0.0.1:8180:8080" # admin console: http://localhost:8180
+
+  nginx:
+    ports:
+      - "127.0.0.1:8080:80" # gateway entrypoint: http://localhost:8080/api/**
+
+  # Backend service placeholders (bind mounts, hot reload) and mocks land here
+  # once backend/ exists and contracts are generated — design §2/§8.
